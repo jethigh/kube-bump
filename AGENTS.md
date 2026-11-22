@@ -7,42 +7,47 @@ description: Core project overview, commands, structure, conventions, ADR rules,
 
 ## Commands
 Run these exact commands from the repository root to verify work (overrides default commands in language-specific rules):
-- Install: `[e.g., uv sync]`
-- Dev: `[e.g., uv run ...]`
-- Build: `[e.g., ...]`
-- Lint & Typecheck: `[e.g., uv run ruff check . && uv run pyright]`
-- Test (all): `[e.g., uv run pytest]`
-- Test (single file): `[e.g., uv run pytest tests/path/to/test_file.py]`
+- Install: `uv sync`
+- Syntax check: `ansible-playbook playbooks/upgrade.yml --syntax-check`
+- Lint: `ansible-lint playbooks/upgrade.yml`
+- YAML lint: `yamllint .`
 
 ## Project & Stack
-- **Purpose:** [1-2 sentences: what the project does]
-- **Stack (with versions):** [e.g., Python 3.12, Bash 5.2, Helm 3.x]
+- **Purpose:** Automated, zero-downtime rolling upgrade orchestrator for kubeadm-based Kubernetes clusters with integrated etcd backups and VirtualBox hypervisor live snapshots.
+- **Stack (with versions):** Ansible >= 2.15, Python >= 3.10, Kubernetes (kubeadm, kubelet, kubectl) >= 1.30, VirtualBox (VBoxManage).
 - **Structure:**
-  - `src/[module]/` — [responsibility]
-  - `tests/` — [how tests mirror `src/`]
-  - `docs/architecture.md` — Module boundaries, data flow, external integrations
-  - `docs/adr/` — Architectural Decision Records (immutable)
+  - `playbooks/` — Ansible playbooks (`upgrade.yml`) and modular task includes (`tasks/update_k8s_repo.yml`).
+  - `inventory/` — Cluster host definitions (`hosts.ini`) and configuration variables (`group_vars/all.yml`).
+  - `docs/architecture.md` — Module boundaries, data flow, external integrations, and invariants.
+  - `docs/adr/` — Architectural Decision Records (immutable records of architectural decisions).
 
 ## Testing & Code Style
-- **Test convention:** [e.g., pytest; mirror `src/` paths as `test_*.py`; shared fixtures in `tests/conftest.py`]
+- **Test convention:** Validate playbook syntax with `ansible-playbook --syntax-check playbooks/upgrade.yml` and enforce code standards via `ansible-lint`. Never execute playbooks against live clusters or inventories without explicit user authorization.
 - **Canonical examples (follow these instead of inventing new patterns):**
-  - [e.g., Core service & error handling: `src/app/services/example.py`]
-  - [e.g., CLI / entry point: `src/app/cli.py`]
+  - Node upgrade sequence and task delegation: `playbooks/upgrade.yml` (e.g., node drain and uncordon delegated to `control_plane[0]`).
+  - Dynamic APT repository and GPG key management: `playbooks/tasks/update_k8s_repo.yml`.
 - **Gotchas / Non-obvious rules:**
-  - [Add rules here ONLY after an agent makes the same mistake twice]
+  - Never execute `ansible-playbook` against live cluster hosts (even with `--check`) without explicit user permission.
+  - Always use Fully Qualified Collection Names (FQCN) for modules (e.g., `ansible.builtin.apt`, `ansible.builtin.command`).
+  - Kubernetes upgrades must strictly progress sequentially by exactly one minor version ($N \rightarrow N+1$); multi-version minor skips are unsupported by kubeadm.
+  - Worker nodes must never be upgraded before control plane nodes reach the target version.
+  - Package selections for `kubeadm`, `kubelet`, and `kubectl` must always be placed on `hold` after package upgrades.
+  - Commands executing `kubectl` or `kubeadm` must specify explicit `changed_when` conditions to preserve idempotency and satisfy linter checks.
 
 ## Project Context & ADRs
 Links below are not auto-loaded — read them explicitly when relevant:
-- Read [docs/architecture.md](../../docs/architecture.md) before adding a new module, integration, or changing data flow.
+- Read [docs/architecture.md](docs/architecture.md) before adding a new module, integration, or changing data flow.
 - Check filenames in `docs/adr/` before altering core architecture, auth, storage, or dependencies; read matching ADRs.
-- When making a significant architectural trade-off (only when requested or during a structural change), create a new ADR using [docs/adr/0000-template.md](../../docs/adr/0000-template.md). Never edit past ADRs; supersede them instead.
+- When making a significant architectural trade-off (only when requested or during a structural change), create a new ADR using [docs/adr/0000-template.md](docs/adr/0000-template.md). Never edit past ADRs; supersede them instead.
 - Do not document file trees, line-by-line summaries, or rules already enforced by linters/formatters.
 
 ## Git Workflow
-- Branches: `[e.g., feat/<slug>, fix/<slug>, chore/<slug>]`
-- Commits: `[e.g., Conventional Commits: feat(scope): short summary]`
+- Branches: `feat/<slug>`, `fix/<slug>`, `chore/<slug>`, `docs/<slug>`
+- Commits: Conventional Commits: `feat(scope): short summary`, `fix(scope): short summary`, `docs(scope): short summary`
+- Trailers: Include co-authorship trailer: `Co-authored-by: <Tool/Agent> <<identifier_or_email>>`
 
 ## Boundaries
-- **Always do:** Run lint, typecheck, and targeted tests after edits; keep diffs focused on the requested task.
-- **Ask first:** Adding new dependencies, modifying DB migrations/schema, changing CI/CD workflows, or contradicting an accepted ADR.
-- **Never do:** Commit secrets or `.env` files; edit generated directories (`[e.g., src/generated/]`); skip or weaken failing tests.
+- **Language:** In created files in comments, readme, documentations use English. With user communicate with language used by user.
+- **Always do:** Run syntax check and lint after edits; keep diffs focused on the requested task.
+- **Ask first:** Adding new dependencies, modifying cluster upgrade sequence, changing CI/CD workflows, or contradicting an accepted ADR.
+- **Never do:** Run destructive commands or live cluster playbook execution without user consent; commit secrets or `.env` files; skip or weaken failing lint checks.

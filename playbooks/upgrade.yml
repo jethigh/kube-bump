@@ -1,0 +1,264 @@
+---
+# ==============================================================================
+# 1. Pre-flight checks and VirtualBox snapshots (executed locally on the control host)
+# ==============================================================================
+- name: Pre-flight checks and VirtualBox snapshots
+  hosts: localhost
+  connection: local
+  become: false
+  gather_facts: true
+  vars:
+    snapshot_name: "{{ vbox_snapshot_prefix }}-{{ k8s_target_version }}-{{ ansible_date_time.epoch }}"
+  tasks:
+    - name: Print kube-bump banner
+      ansible.builtin.debug:
+        msg: |
+           _            _                 _
+          | | __ _   _ | |__    ___      | |__   _   _  _ __ ___   _ __
+          | |/ /| | | || '_ \  / _ \ ___ | '_ \ | | | || '_ ` _ \ | '_ \
+          |   < | |_| || |_) ||  __/|___|| |_) || |_| || | | | | || |_) |
+          |_|\_\ \__,_||_.__/  \___|     |_.__/  \__,_||_| |_| |_|| .__/
+                                                                  |_|
+          Target Kubernetes version: v{{ k8s_target_version }}
+
+    - name: Take live VirtualBox snapshots for all cluster VMs
+      ansible.builtin.command: >
+        VBoxManage snapshot "{{ hostvars[item].vbox_vm_name }}"
+        take "{{ snapshot_name }}" --live
+      loop: "{{ groups['k8s_cluster'] }}"
+      when:
+        - vbox_snapshot_enabled | bool
+        - hostvars[item].vbox_vm_name is defined
+      changed_when: true
+
+# ==============================================================================
+# 2. etcd backup and primary Control Plane node upgrade
+# ==============================================================================
+- name: Upgrade primary Control Plane node
+  hosts: control_plane[0]
+  serial: 1
+  tasks:
+    - name: Ensure etcd backup directory exists
+      ansible.builtin.file:
+        path: "{{ etcd_backup_dir }}"
+        state: directory
+        mode: "0700"
+      when: etcd_backup_enabled | bool
+
+    - name: Create etcd snapshot
+      ansible.builtin.command: >
+        etcdctl snapshot save {{ etcd_backup_dir }}/etcd-{{ ansible_date_time.epoch }}.db
+        --endpoints=https://127.0.0.1:2379
+        --cacert=/etc/kubernetes/pki/etcd/ca.crt
+        --cert=/etc/kubernetes/pki/etcd/server.crt
+        --key=/etc/kubernetes/pki/etcd/server.key
+      environment:
+        ETCDCTL_API: "3"
+      when: etcd_backup_enabled | bool
+      changed_when: true
+
+    - name: Update Kubernetes apt repository
+      ansible.builtin.include_tasks: tasks/update_k8s_repo.yml
+
+    - name: Unhold kubeadm
+      ansible.builtin.dpkg_selections:
+        name: kubeadm
+        selection: install
+
+    - name: Upgrade kubeadm to {{ k8s_target_version }}
+      ansible.builtin.apt:
+        name: "kubeadm={{ k8s_target_version }}-*"
+        state: present
+        allow_downgrade: false
+
+    - name: Hold kubeadm
+      ansible.builtin.dpkg_selections:
+        name: kubeadm
+        selection: hold
+
+    - name: Apply kubeadm upgrade on primary Control Plane
+      ansible.builtin.command: "kubeadm upgrade apply v{{ k8s_target_version }} -y"
+      register: kubeadm_apply
+      changed_when: "'SUCCESS' in kubeadm_apply.stdout"
+
+    - name: Drain primary Control Plane node
+      ansible.builtin.command: >
+        kubectl --kubeconfig=/etc/kubernetes/admin.conf drain {{ inventory_hostname }}
+        --ignore-daemonsets --delete-emptydir-data
+      changed_when: true
+
+    - name: Unhold kubelet and kubectl
+      ansible.builtin.dpkg_selections:
+        name: "{{ item }}"
+        selection: install
+      loop:
+        - kubelet
+        - kubectl
+
+    - name: Upgrade kubelet and kubectl to {{ k8s_target_version }}
+      ansible.builtin.apt:
+        name:
+          - "kubelet={{ k8s_target_version }}-*"
+          - "kubectl={{ k8s_target_version }}-*"
+        state: present
+
+    - name: Hold kubelet and kubectl
+      ansible.builtin.dpkg_selections:
+        name: "{{ item }}"
+        selection: hold
+      loop:
+        - kubelet
+        - kubectl
+
+    - name: Restart kubelet
+      ansible.builtin.systemd:
+        name: kubelet
+        daemon_reload: true
+        state: restarted
+
+    - name: Uncordon primary Control Plane node
+      ansible.builtin.command: >
+        kubectl --kubeconfig=/etc/kubernetes/admin.conf uncordon {{ inventory_hostname }}
+      changed_when: true
+
+# ==============================================================================
+# 3. Upgrade additional Control Plane nodes (for HA clusters)
+# ==============================================================================
+- name: Upgrade additional Control Plane nodes
+  hosts: control_plane[1:]
+  serial: 1
+  tasks:
+    - name: Update Kubernetes apt repository
+      ansible.builtin.include_tasks: tasks/update_k8s_repo.yml
+
+    - name: Unhold kubeadm
+      ansible.builtin.dpkg_selections:
+        name: kubeadm
+        selection: install
+
+    - name: Upgrade kubeadm to {{ k8s_target_version }}
+      ansible.builtin.apt:
+        name: "kubeadm={{ k8s_target_version }}-*"
+        state: present
+
+    - name: Hold kubeadm
+      ansible.builtin.dpkg_selections:
+        name: kubeadm
+        selection: hold
+
+    - name: Run kubeadm upgrade node
+      ansible.builtin.command: kubeadm upgrade node
+      changed_when: true
+
+    - name: Drain Control Plane node
+      ansible.builtin.command: >
+        kubectl --kubeconfig=/etc/kubernetes/admin.conf drain {{ inventory_hostname }}
+        --ignore-daemonsets --delete-emptydir-data
+      delegate_to: "{{ groups['control_plane'][0] }}"
+      changed_when: true
+
+    - name: Unhold kubelet and kubectl
+      ansible.builtin.dpkg_selections:
+        name: "{{ item }}"
+        selection: install
+      loop:
+        - kubelet
+        - kubectl
+
+    - name: Upgrade kubelet and kubectl
+      ansible.builtin.apt:
+        name:
+          - "kubelet={{ k8s_target_version }}-*"
+          - "kubectl={{ k8s_target_version }}-*"
+        state: present
+
+    - name: Hold kubelet and kubectl
+      ansible.builtin.dpkg_selections:
+        name: "{{ item }}"
+        selection: hold
+      loop:
+        - kubelet
+        - kubectl
+
+    - name: Restart kubelet
+      ansible.builtin.systemd:
+        name: kubelet
+        daemon_reload: true
+        state: restarted
+
+    - name: Uncordon Control Plane node
+      ansible.builtin.command: >
+        kubectl --kubeconfig=/etc/kubernetes/admin.conf uncordon {{ inventory_hostname }}
+      delegate_to: "{{ groups['control_plane'][0] }}"
+      changed_when: true
+
+# ==============================================================================
+# 4. Rolling upgrade of Worker nodes (sequential)
+# ==============================================================================
+- name: Upgrade Worker nodes
+  hosts: workers
+  serial: 1
+  tasks:
+    - name: Update Kubernetes apt repository
+      ansible.builtin.include_tasks: tasks/update_k8s_repo.yml
+
+    - name: Unhold kubeadm
+      ansible.builtin.dpkg_selections:
+        name: kubeadm
+        selection: install
+
+    - name: Upgrade kubeadm to {{ k8s_target_version }}
+      ansible.builtin.apt:
+        name: "kubeadm={{ k8s_target_version }}-*"
+        state: present
+
+    - name: Hold kubeadm
+      ansible.builtin.dpkg_selections:
+        name: kubeadm
+        selection: hold
+
+    - name: Run kubeadm upgrade node
+      ansible.builtin.command: kubeadm upgrade node
+      changed_when: true
+
+    - name: Drain worker node
+      ansible.builtin.command: >
+        kubectl --kubeconfig=/etc/kubernetes/admin.conf drain {{ inventory_hostname }}
+        --ignore-daemonsets --delete-emptydir-data
+      delegate_to: "{{ groups['control_plane'][0] }}"
+      changed_when: true
+
+    - name: Unhold kubelet and kubectl
+      ansible.builtin.dpkg_selections:
+        name: "{{ item }}"
+        selection: install
+      loop:
+        - kubelet
+        - kubectl
+
+    - name: Upgrade kubelet and kubectl
+      ansible.builtin.apt:
+        name:
+          - "kubelet={{ k8s_target_version }}-*"
+          - "kubectl={{ k8s_target_version }}-*"
+        state: present
+
+    - name: Hold kubelet and kubectl
+      ansible.builtin.dpkg_selections:
+        name: "{{ item }}"
+        selection: hold
+      loop:
+        - kubelet
+        - kubectl
+
+    - name: Restart kubelet
+      ansible.builtin.systemd:
+        name: kubelet
+        daemon_reload: true
+        state: restarted
+
+    - name: Uncordon worker node
+      ansible.builtin.command: >
+        kubectl --kubeconfig=/etc/kubernetes/admin.conf uncordon {{ inventory_hostname }}
+      delegate_to: "{{ groups['control_plane'][0] }}"
+      changed_when: true

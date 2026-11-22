@@ -1,0 +1,11 @@
+# Target Kubernetes version (increment by at most 1 minor version at a time!)
+k8s_target_version: "1.32.2"
+k8s_minor_version: "{{ k8s_target_version.split('.')[0:2] | join('.') }}"
+
+# Automated host VM snapshots before starting upgrade (VirtualBox)
+vbox_snapshot_enabled: true
+vbox_snapshot_prefix: "pre-kube-bump"
+
+# etcd backup before Control Plane upgrade (requires etcd-client on primary CP)
+etcd_backup_enabled: true
+etcd_backup_dir: "/var/backups/kube-bump"

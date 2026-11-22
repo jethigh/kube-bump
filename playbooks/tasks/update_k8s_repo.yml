@@ -1,0 +1,21 @@
+---
+- name: Ensure keyrings directory exists
+  ansible.builtin.file:
+    path: /etc/apt/keyrings
+    state: directory
+    mode: "0755"
+
+- name: Download Kubernetes release GPG key for v{{ k8s_minor_version }}
+  ansible.builtin.shell: |
+    curl -fsSL https://pkgs.k8s.io/core:/stable:/v{{ k8s_minor_version }}/deb/Release.key \
+      | gpg --dearmor --yes -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+  args:
+    executable: /bin/bash
+  changed_when: false
+
+- name: Configure Kubernetes apt repository for v{{ k8s_minor_version }}
+  ansible.builtin.apt_repository:
+    repo: "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v{{ k8s_minor_version }}/deb/ /"
+    filename: kubernetes
+    state: present
+    update_cache: true
